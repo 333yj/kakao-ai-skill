@@ -164,7 +164,7 @@ async def chat(request: Request):
     except Exception:
         # LLM 실패 시: 캐스케이드 fallback
         return JSONResponse(content=build_simple_text(
-            DEFAULT.get("intro", "안내를 정리 중이에요. 잠시 후 다시 시도하시거나 1:1 상담 연결을 통해 문의해 주세요.")
+            DEFAULT.get("intro", "1:1 상담 연결 안내: 잠시 후 다시 시도하시거나 1:1 상담 연결을 통해 문의해 주세요.")
         ))
 
     # 200자 가드레일 강제 트림
