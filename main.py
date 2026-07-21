@@ -83,7 +83,7 @@ def call_gemini(prompt: str) -> str:
     req = urllib.request.Request(
         url, data=req_body, headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
