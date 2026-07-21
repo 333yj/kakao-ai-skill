@@ -84,7 +84,7 @@ async def call_llm(utterance: str, faq_hint: str = "") -> str:
             f"[참고 - 같은 의도의 FAQ 답변 힌트]\n{faq_hint}\n\n"
             f"[사용자 질문]\n{utterance}\n\n"
             "[답변 응답 조건]\n"
-            f"- 200자 이내 한국어 정중·간결 답변\n"
+            f"- 350자 이내 한국어 정중·간결 답변\n"
             f"- 위에 FAQ 힌트가 있으니 그 결을 따라 짧고 정확하게 작성\n"
             f"- 1:1 상담 연결 필요 안내: 정확한 안내가 어려울 때 1회만 포함\n"
         )
