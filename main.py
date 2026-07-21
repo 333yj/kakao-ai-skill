@@ -16,9 +16,9 @@ OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # 비용/속도 균형, 한국어 OK
 KNOWLEDGE_FILE   = Path(os.getenv("KNOWLEDGE_FILE",
                                   "/opt/render/project/src/knowledge.json"))
-CHAR_LIMIT       = 200          # 시스템 프롬프트 명시 200자 제한
+CHAR_LIMIT       = 350          # 시스템 프롬프트 명시 200자 제한
 LLM_TIMEOUT_SEC  = 4.0          # 카톡 응답 권장 5초 이내
-LLM_MAX_TOKENS   = 300          # 한국어 약 200자 + 안전마진
+LLM_MAX_TOKENS   = 450          # 한국어 약 200자 + 안전마진
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY,
                      timeout=LLM_TIMEOUT_SEC,
