@@ -1,148 +1,134 @@
 """
-카카오 i 오픈빌더 — OpenRouter 무료 모델 연동 (검색 기준일: 2026-07-21)
-- OpenAI 호환 /v1/chat/completions 엔드포인트
-- 무료 모델은 OpenRouter 대시보드에서 :free 마크 확인
-- pip install openai 또는 표준 라이브러리 그대로 동작
+카카오 i 오픈빌더 — Thin-pointer + LLM (search 기준일 2026-07-21)
+- quick_faq 키워드 매칭 우선 (즉시 응답, 0.1s)
+- 매칭 실패 시 OpenAI gpt-4o-mini 호출 (system_prompt는 knowledge.json에서)
+- 가드레일·200자 제한·상담연결 fallback 포함
+- 오픈소스 SDK: openai 1.x (검증된 httpx==0.27.2 핀)
 """
-import os, json, re, time, urllib.request, urllib.error
+import os, json, re, time
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from openai import AsyncOpenAI
 
 # ── 설정 ────────────────────────────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")     # ⚠️ 새로 발급
-# 무료 모델 후보 3개 — 가용성 변동 있음, 점진적 fallback
-OPENROUTER_MODEL_HINT = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
-OPENROUTER_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "deepseek/deepseek-chat-v3:free",
-]
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # 비용/속도 균형, 한국어 OK
+KNOWLEDGE_FILE   = Path(os.getenv("KNOWLEDGE_FILE",
+                                  "/opt/render/project/src/knowledge.json"))
+CHAR_LIMIT       = 200          # 시스템 프롬프트 명시 200자 제한
+LLM_TIMEOUT_SEC  = 4.0          # 카톡 응답 권장 5초 이내
+LLM_MAX_TOKENS   = 300          # 한국어 약 200자 + 안전마진
 
-KNOWLEDGE_FILE = Path(os.getenv("KNOWLEDGE_FILE", "/opt/render/project/src/knowledge.json"))
+client = AsyncOpenAI(api_key=OPENAI_API_KEY,
+                     timeout=LLM_TIMEOUT_SEC,
+                     max_retries=1)  # 1회 자동 재시도
 
-# ── 지식 코퍼스 로드 ───────────────────────────────────
+# ── knowledge.json 로드 ────────────────────────────────
 def _load_knowledge() -> dict:
     if not KNOWLEDGE_FILE.exists():
-        return {"sources": [], "chunks": [], "ai_router": {}, "default_response": {}}
-    return json.loads(KNOWLEDGE_FILE.read_text(encoding="utf-8"))
+        return {"sources": [], "quick_faq": [], "ai_router": {}, "default_response": {}}
+    try:
+        return json.loads(KNOWLEDGE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"sources": [], "quick_faq": [], "ai_router": {}, "default_response": {}}
 
 KNOWLEDGE = _load_knowledge()
-CORPUS    = KNOWLEDGE.get("chunks", [])
+QUICK_FAQ = KNOWLEDGE.get("quick_faq", [])
 ROUTER    = KNOWLEDGE.get("ai_router", {})
 DEFAULT   = KNOWLEDGE.get("default_response", {})
 
+# 캐시(질문 → 답변, 5분 TTL)
 CACHE: dict = {}
 CACHE_TTL = 300
 
-# ── 시스템 프롬프트 (fallback 포함) ────────────────────
-SYSTEM_PROMPT_FALLBACK = (
-    "당신은 한국기술교육대학교 일학습병행 공동훈련센터 지원단의 상담 안내 챗봇입니다. "
-    "한국어로, 200자 이내, 정중·간결하게 답변하세요. "
-    "참고 문서에 없는 내용은 추정하지 말고 '1:1 상담연결 필요'로 답하세요."
+# ── 시스템 프롬프트 빌더 ───────────────────────────────
+SYSTEM_PROMPT_DEFAULT = (
+    "당신은 일학습병행 안내 AI입니다. "
+    "사용자 질문에 200자 이내, 정중·간결하게 한국어로 답변하세요."
+)
+
+GUARDRAILS_DEFAULT = (
+    "법률 자문·세무 자문·노동 분쟁 해석은 '한국산업인력공단 본부 또는 "
+    "원스탑 상담센터 전문상담 필요'로 안내. 근거 없는 추측 금지."
 )
 
 def build_system_prompt() -> str:
-    sp = ROUTER.get("system_prompt", "").strip()
-    if not sp:
-        return SYSTEM_PROMPT_FALLBACK
-    extra = ROUTER.get("guardrails", "").strip()
-    return sp + ("\n\n[운영 규칙]\n" + extra if extra else "")
+    """ai_router.system_prompt + guardrails 조합"""
+    sp = (ROUTER.get("system_prompt") or SYSTEM_PROMPT_DEFAULT).strip()
+    gr = (ROUTER.get("guardrails")    or GUARDRAILS_DEFAULT).strip()
+    return f"{sp}\n\n[운영 규칙 - 반드시 준수]\n{gr}\n\n- 답변 길이: {CHAR_LIMIT}자 이내\n- 200자 초과 시 truncate\n- 모호하거나 확인이 어려운 경우: 1:1 상담 연결 안내"
 
-# ── RAG: 코퍼스 검색 ───────────────────────────────────
-def search_corpus(utterance: str, top_k: int = 3):
-    if not CORPUS:
-        return []
-    tokens = [t for t in re.split(r"\s+", utterance) if len(t) >= 2]
-    scored = []
-    for c in CORPUS:
-        head = c.get("text", "")[:150]
-        text = c.get("text", "")
-        score = sum(head.count(t) * 2 + text.count(t) for t in tokens)
-        if score > 0:
-            scored.append((score, c))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:top_k]]
+# ── 한 줄 빠른 매칭(키워드 부분 일치) ──────────────────
+def match_quick_faq(utterance: str):
+    norm = utterance.strip()
+    # 1) 정확 매칭
+    for q in QUICK_FAQ:
+        if norm in (q.get("keywords") or []):
+            return q
+    # 2) 부분 매칭
+    for q in QUICK_FAQ:
+        for kw in (q.get("keywords") or []):
+            if kw and kw in norm:
+                return q
+    return None
 
-# ── OpenRouter 호출 (OpenAI 호환) ──────────────────────
-def call_openrouter(utterance: str, chunks: list) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY 환경변수가 없습니다.")
+# ── OpenAI 호출 ────────────────────────────────────────
+async def call_llm(utterance: str, faq_hint: str = "") -> str:
+    """system 프롬프트는 JSON에서, user는 발화 + FAQ 힌트로 구성"""
+    system_prompt = build_system_prompt()
 
-    context_text = "\n".join(f"[참고{i+1}]\n{c['text'][:600]}" for i, c in enumerate(chunks))
+    user_text = utterance
+    if faq_hint:
+        user_text = (
+            f"[참고 - 같은 의도의 FAQ 답변 힌트]\n{faq_hint}\n\n"
+            f"[사용자 질문]\n{utterance}\n\n"
+            "[답변 응답 조건]\n"
+            f"- 200자 이내 한국어 정중·간결 답변\n"
+            f"- 위에 FAQ 힌트가 있으니 그 결을 따라 짧고 정확하게 작성\n"
+            f"- 1:1 상담 연결 필요 안내: 정확한 안내가 어려울 때 1회만 포함\n"
+        )
 
-    user_prompt = (
-        "다음 참고 문서 발췌를 근거로 사용자 질문에 답변하세요.\n"
-        "문서에 없는 내용은 추정하지 말고 담당 컨설턴트 안내로 응답하세요.\n\n"
-        f"{context_text}\n\n[질문]\n{utterance}"
+    resp = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_text},
+        ],
+        temperature=0.4,        # 검색으로 확인, OpenAI 1.x 유효 파라미터
+        max_tokens=LLM_MAX_TOKENS,  # gpt-4o-mini에서 유효 (검색 검증)
     )
+    text = (resp.choices[0].message.content or "").strip()
+    return truncate(text, CHAR_LIMIT + 60)  # 200자 가드레일 강제
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://kakao-ai-skill.onrender.com",  # OpenRouter 권장
-        "X-Title":       "Kakao AI Skill",
-    }
-
-    last_err = None
-    # 무료 모델 다운 시 자동 fallback
-    for model in [OPENROUTER_MODEL_HINT] + [m for m in OPENROUTER_MODELS if m != OPENROUTER_MODEL_HINT]:
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": build_system_prompt()},
-                {"role": "user",   "content": user_prompt},
-            ],
-            "temperature": 0.4,
-            "max_tokens":  400,
-        }
-        try:
-            req = urllib.request.Request(
-                OPENROUTER_URL,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=4.5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            txt = (data["choices"][0]["message"]["content"] or "").strip()
-            if txt:
-                return txt
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code}: {e.reason}"
-            if e.code in (429, 500, 503):
-                time.sleep(0.4)
-                continue
-        except Exception as e:
-            last_err = str(e)
-            break
-
-    raise RuntimeError(f"OpenRouter 호출 실패: {last_err}")
-
-# ── 응답 빌더 ──────────────────────────────────────────
-def trim(t: str, limit: int = 480) -> str:
-    return t if len(t) <= limit else t[: limit - 1] + "…"
+def truncate(text: str, hard: int = CHAR_LIMIT) -> str:
+    if len(text) <= hard:
+        return text
+    return text[: hard - 1] + "…"
 
 def build_simple_text(t: str):
-    return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": trim(t)}}]}}
+    return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": t}}]}}
 
-# ── 앱 ─────────────────────────────────────────────────
+# ── App ─────────────────────────────────────────────────
 app = FastAPI()
 
 @app.get("/")
 async def health():
+    """health: mode + 상태 노출"""
+    has_key = bool(OPENAI_API_KEY)
     return {
         "status": "ok",
-        "provider": "openrouter-free",
-        "model_hint": OPENROUTER_MODEL_HINT,
-        "chunks_loaded": len(CORPUS),
-        "cache_size": len(CACHE),
-        "key_set": bool(OPENROUTER_API_KEY),
+        "service": "kakao-ai-skill",
+        "mode": "thin-pointer + LLM-fallback",
+        "model": OPENAI_MODEL if has_key else None,
+        "quick_faq_count": len(QUICK_FAQ),
+        "system_prompt_chars": len(build_system_prompt()),
+        "openai_key_set": has_key,
     }
 
 @app.post("/api/chat")
 async def chat(request: Request):
+    """메인 스킬 엔드포인트"""
     try:
         body = await request.json()
     except Exception:
@@ -150,20 +136,39 @@ async def chat(request: Request):
 
     utt = (body.get("userRequest") or {}).get("utterance", "").strip()
     if not utt:
-        return JSONResponse(content=build_simple_text("안녕하세요! AI 자동 상담봇입니다. 무엇을 도와드릴까요?"))
+        return JSONResponse(content=build_simple_text("안녕하세요! 무엇을 도와드릴까요?"))
 
+    # 캐시 check
     cache_key = utt.lower()
     if cache_key in CACHE and time.time() - CACHE[cache_key]["t"] < CACHE_TTL:
         return JSONResponse(content=build_simple_text(CACHE[cache_key]["text"]))
 
-    chunks = search_corpus(utt, top_k=3)
+    # 1) quick_faq 정확/부분 매칭 (즉시, LLM 미호출)
+    faq_match = match_quick_faq(utt)
+    if faq_match and faq_match.get("answer"):
+        ans = faq_match["answer"]
+        CACHE[cache_key] = {"t": time.time(), "text": ans}
+        return JSONResponse(content=build_simple_text(ans))
+
+    # 2) LLM 호출 (system_prompt ← knowledge.json)
+    #    faq_hint: 가장 잘 어울리는 1개 답변을 user 메시지에 함께 전달 (답변 일관성 ↑)
+    faq_hint = faq_match["answer"] if faq_match else ""
+
+    if not OPENAI_API_KEY:
+        return JSONResponse(content=build_simple_text(
+            DEFAULT.get("intro", "1:1 상담 연결 안내: 잠시 후 다시 시도하시거나 1:1 상담 연결을 통해 문의해 주세요.")
+        ))
+
     try:
-        ans = call_openrouter(utt, chunks)
+        ans = await call_llm(utt, faq_hint=faq_hint)
     except Exception:
-        if chunks:
-            ans = chunks[0]["text"][:280] + "\n\n자세한 내용은 1:1 상담을 통해 문의해 주세요."
-        else:
-            ans = (DEFAULT.get("intro", "자세한 내용은 1:1 상담을 통해 문의해 주세요."))
+        # LLM 실패 시: 캐스케이드 fallback
+        return JSONResponse(content=build_simple_text(
+            DEFAULT.get("intro", "안내를 정리 중이에요. 잠시 후 다시 시도하시거나 1:1 상담 연결을 통해 문의해 주세요.")
+        ))
+
+    # 200자 가드레일 강제 트림
+    ans = truncate(ans, CHAR_LIMIT)
 
     CACHE[cache_key] = {"t": time.time(), "text": ans}
     return JSONResponse(content=build_simple_text(ans))
