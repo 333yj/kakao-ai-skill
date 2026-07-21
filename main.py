@@ -1,177 +1,231 @@
 """
-카카오 i 오픈빌더 — Thin-pointer + LLM (search 기준일 2026-07-21)
-- quick_faq 키워드 매칭 우선 (즉시 응답, 0.1s)
-- 매칭 실패 시 OpenAI gpt-4o-mini 호출 (system_prompt는 knowledge.json에서)
-- 가드레일·200자 제한·상담연결 fallback 포함
-- 오픈소스 SDK: openai 1.x (검증된 httpx==0.27.2 핀)
+카카오 i 오픈빌더 — LLM-우선 자유 답변 스킬 (multi-bubble)
+검색 기준일: 2026-07-21
 """
-import os, json, re, time
+import os, json, re, time, sys
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from openai import AsyncOpenAI
+import httpx
 
-# ── 설정 ────────────────────────────────────────────────
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # 비용/속도 균형, 한국어 OK
-KNOWLEDGE_FILE   = Path(os.getenv("KNOWLEDGE_FILE",
-                                  "/opt/render/project/src/knowledge.json"))
-CHAR_LIMIT       = 350          # 시스템 프롬프트 명시 200자 제한
-LLM_TIMEOUT_SEC  = 4.0          # 카톡 응답 권장 5초 이내
-LLM_MAX_TOKENS   = 450          # 한국어 약 200자 + 안전마진
+# ── 설정 ────────────────────────────────────────────────────
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL_DEFAULT = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_URL           = "https://api.openai.com/v1/chat/completions"
+KNOWLEDGE_FILE       = Path(os.getenv("KNOWLEDGE_FILE",
+                                      "/opt/render/project/src/knowledge.json"))
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY,
-                     timeout=LLM_TIMEOUT_SEC,
-                     max_retries=1)  # 1회 자동 재시도
+CACHE_TTL_SEC        = int(os.getenv("CACHE_TTL_SEC", "300"))
+OPENAI_TIMEOUT       = float(os.getenv("OPENAI_TIMEOUT", "4.0"))
+SIMPLE_BUBBLE_CHARS  = 990
 
-# ── knowledge.json 로드 ────────────────────────────────
 def _load_knowledge() -> dict:
     if not KNOWLEDGE_FILE.exists():
-        return {"sources": [], "quick_faq": [], "ai_router": {}, "default_response": {}}
-    try:
-        return json.loads(KNOWLEDGE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"sources": [], "quick_faq": [], "ai_router": {}, "default_response": {}}
+        return {"sources": [], "quick_faq": [], "ai_router": {},
+                "default_response": {"intro":"","extra_resources":[],"footer_messages":[]}}
+    return json.loads(KNOWLEDGE_FILE.read_text(encoding="utf-8"))
 
-KNOWLEDGE = _load_knowledge()
-QUICK_FAQ = KNOWLEDGE.get("quick_faq", [])
-ROUTER    = KNOWLEDGE.get("ai_router", {})
-DEFAULT   = KNOWLEDGE.get("default_response", {})
+KNOWLEDGE  = _load_knowledge()
+ROUTER     = KNOWLEDGE.get("ai_router")       or {}
+QUICK_FAQ  = KNOWLEDGE.get("quick_faq")        or []
+DEFAULT    = KNOWLEDGE.get("default_response") or {}
+SOURCES    = KNOWLEDGE.get("sources")          or []
 
-# 캐시(질문 → 답변, 5분 TTL)
+OPENAI_MODEL  = ROUTER.get("model") or OPENAI_MODEL_DEFAULT
+SYSTEM_PROMPT = ROUTER.get("system_prompt") or (
+    "당신은 한국기술교육대학교 일학습병행 공동훈련센터의 상담 안내 챗봇입니다.\n"
+    "- 한국어로 정중·간결하게 답변 (500자 이내).\n"
+    "- 정확한 정보가 없으면 '1:1 상담 연결 안내'로 응답.\n"
+    "- 매칭된 FAQ가 있으면 그 결을 따라 동일 톤·동일 길이."
+)
+GUARDRAILS  = ROUTER.get("guardrails") or (
+    "법률·세무·노동 분쟁 해석은 '한국산업인력공단 본부 또는 원스탑 상담센터 "
+    "전문상담' 안내. 근거 없는 추측 금지."
+)
+TEMPERATURE = float(ROUTER.get("temperature", 0.4))
+MAX_TOKENS  = int(ROUTER.get("max_tokens", 600))
+TIMEOUT_SEC = float(ROUTER.get("timeout_sec", OPENAI_TIMEOUT))
+
 CACHE: dict = {}
-CACHE_TTL = 300
 
-# ── 시스템 프롬프트 빌더 ───────────────────────────────
-SYSTEM_PROMPT_DEFAULT = (
-    "당신은 일학습병행 안내 AI입니다. "
-    "사용자 질문에 200자 이내, 정중·간결하게 한국어로 답변하세요."
-)
+NORM_RX = re.compile(r"[\s\.\,\!\?\·\:\;\"\'\(\)\[\]\/]+")
+def norm(s: str) -> str:
+    return NORM_RX.sub("", s or "").strip().lower()
 
-GUARDRAILS_DEFAULT = (
-    "법률 자문·세무 자문·노동 분쟁 해석은 '한국산업인력공단 본부 또는 "
-    "원스탑 상담센터 전문상담 필요'로 안내. 근거 없는 추측 금지."
-)
+def score_entry(utt_norm, entry):
+    total, exact = 0, 0
+    for kw in (entry.get("keywords") or []):
+        k = norm(kw)
+        if not k: continue
+        if k == utt_norm: total += 100; exact += 1
+        elif k in utt_norm: total += len(k) * 2
+    return total, exact
 
-def build_system_prompt() -> str:
-    """ai_router.system_prompt + guardrails 조합"""
-    sp = (ROUTER.get("system_prompt") or SYSTEM_PROMPT_DEFAULT).strip()
-    gr = (ROUTER.get("guardrails")    or GUARDRAILS_DEFAULT).strip()
-    return f"{sp}\n\n[운영 규칙 - 반드시 준수]\n{gr}\n\n- 답변 길이: {CHAR_LIMIT}자 이내\n- 200자 초과 시 truncate\n- 모호하거나 확인이 어려운 경우: 1:1 상담 연결 안내"
-
-# ── 한 줄 빠른 매칭(키워드 부분 일치) ──────────────────
-def match_quick_faq(utterance: str):
-    norm = utterance.strip()
-    # 1) 정확 매칭
+def match_quick_faq(utterance):
+    u = norm(utterance)
+    if not u: return None
+    best, bt, be = None, 0, -1
     for q in QUICK_FAQ:
-        if norm in (q.get("keywords") or []):
-            return q
-    # 2) 부분 매칭
-    for q in QUICK_FAQ:
-        for kw in (q.get("keywords") or []):
-            if kw and kw in norm:
-                return q
-    return None
+        t, e = score_entry(u, q)
+        if (e, t) > (be, bt): best, bt, be = q, t, e
+    return best if bt > 0 else None
 
-# ── OpenAI 호출 ────────────────────────────────────────
-async def call_llm(utterance: str, faq_hint: str = "") -> str:
-    """system 프롬프트는 JSON에서, user는 발화 + FAQ 힌트로 구성"""
-    system_prompt = build_system_prompt()
-
-    user_text = utterance
+async def call_llm(user_utterance, faq_hint=""):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY environment empty")
+    system_text = SYSTEM_PROMPT.strip()
+    if (GUARDRAILS or "").strip():
+        system_text += "\n\n[운영 규칙]\n" + GUARDRAILS.strip()
+    user_text = user_utterance
     if faq_hint:
         user_text = (
-            f"[참고 - 같은 의도의 FAQ 답변 힌트]\n{faq_hint}\n\n"
-            f"[사용자 질문]\n{utterance}\n\n"
-            "[답변 응답 조건]\n"
-            f"- 350자 이내 한국어 정중·간결 답변\n"
-            f"- 위에 FAQ 힌트가 있으니 그 결을 따라 짧고 정확하게 작성\n"
-            f"- 1:1 상담 연결 필요 안내: 정확한 안내가 어려울 때 1회만 포함\n"
+            "[참고 FAQ 힌트]\n"+faq_hint+"\n\n[질문]\n"+user_utterance+"\n\n"
+            "[응답 조건]\n- 한국어 500자 이내\n- FAQ 결을 따라 정확·간결\n"
+            "- 필요 시 1:1 상담 연결 안내 1회"
         )
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
+               "Content-Type":  "application/json"}
+    payload = {"model": OPENAI_MODEL,
+               "messages":[{"role":"system","content":system_text},
+                           {"role":"user","content":user_text}],
+               "max_tokens":MAX_TOKENS, "temperature":TEMPERATURE}
+    async with httpx.AsyncClient(timeout=TIMEOUT_SEC) as client:
+        r = await client.post(OPENAI_URL, headers=headers, json=payload)
+        # 401/429/5xx는 이유 분리해서 노출
+        if r.status_code == 401:
+            raise RuntimeError("OPENAI 401 Unauthorized — 키 무효/만료")
+        if r.status_code == 429:
+            raise RuntimeError("OPENAI 429 quota exceeded — 한도 초과")
+        r.raise_for_status()
+        data = r.json()
+    text = (data["choices"][0]["message"]["content"] or "").strip()
+    if not text:
+        raise RuntimeError("OPENAI empty content")
+    return text
 
-    resp = await client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_text},
-        ],
-        temperature=0.4,        # 검색으로 확인, OpenAI 1.x 유효 파라미터
-        max_tokens=LLM_MAX_TOKENS,  # gpt-4o-mini에서 유효 (검색 검증)
-    )
-    text = (resp.choices[0].message.content or "").strip()
-    return truncate(text, CHAR_LIMIT + 60)  # 200자 가드레일 강제
+def _trim_to_limit(text, limit=SIMPLE_BUBBLE_CHARS):
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
-def truncate(text: str, hard: int = CHAR_LIMIT) -> str:
-    if len(text) <= hard:
-        return text
-    return text[: hard - 1] + "…"
+def _simple_bubble(text):
+    return {"simpleText": {"text": _trim_to_limit(text or "", SIMPLE_BUBBLE_CHARS)}}
 
-def build_simple_text(t: str):
-    return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": t}}]}}
+def build_simple_text_reply(text):
+    return {"version":"2.0","template":{"outputs":[_simple_bubble(text)]}}
 
-# ── App ─────────────────────────────────────────────────
+def build_multi_bubble_reply(bubbles):
+    outs = []
+    for b in (bubbles or []):
+        b = (b or "").strip()
+        if b: outs.append(_simple_bubble(b))
+    if not outs:
+        outs = [_simple_bubble("안녕하세요! 무엇을 도와드릴까요?")]
+    return {"version":"2.0","template":{"outputs":outs}}
+
+def _build_extra_sections():
+    blocks = []
+    for sec in (DEFAULT.get("extra_resources") or []):
+        header = (sec.get("header") or "").strip()
+        lines  = []
+        if header: lines.append(header)
+        for it in (sec.get("items") or []):
+            lab = (it.get("label") or "").strip()
+            url = (it.get("url")   or "").strip()
+            if lab and url:
+                lines.append(f"• {lab}"); lines.append(f"  {url}")
+            elif lab: lines.append(f"• {lab}")
+            elif url: lines.append(f"• {url}")
+        if lines: blocks.append("\n".join(lines))
+    return "\n\n".join(blocks).strip()
+
+def _join_default_bubbles():
+    intro   = (DEFAULT.get("intro") or "").strip()
+    extra   = _build_extra_sections()
+    footers = "\n".join(DEFAULT.get("footer_messages") or []).strip()
+    bubbles = []
+    if intro:   bubbles.append(intro)
+    if extra:   bubbles.append(extra)
+    if footers: bubbles.append(footers)
+    return bubbles or ["안녕하세요! 무엇을 도와드릴까요?"]
+
+def answers_bubbles_for(answer):
+    bubbles = [_trim_to_limit(answer, SIMPLE_BUBBLE_CHARS)]
+    extra = _build_extra_sections()
+    footers = "\n".join(DEFAULT.get("footer_messages") or []).strip()
+    if extra:   bubbles.append(extra)
+    if footers: bubbles.append(footers)
+    return bubbles
+
+def cache_get(utt_norm):
+    hit = CACHE.get(utt_norm)
+    if hit and time.time() - hit["t"] < CACHE_TTL_SEC:
+        return hit["text"]
+    return None
+
+def cache_set(utt_norm, text):
+    CACHE[utt_norm] = {"t": time.time(), "text": text}
+
 app = FastAPI()
 
 @app.get("/")
 async def health():
-    """health: mode + 상태 노출"""
-    has_key = bool(OPENAI_API_KEY)
-    return {
-        "status": "ok",
-        "service": "kakao-ai-skill",
-        "mode": "thin-pointer + LLM-fallback",
-        "model": OPENAI_MODEL if has_key else None,
-        "quick_faq_count": len(QUICK_FAQ),
-        "system_prompt_chars": len(build_system_prompt()),
-        "openai_key_set": has_key,
-    }
+    return {"status":"ok","service":"kakao-ai-skill",
+            "openai_model":OPENAI_MODEL if OPENAI_API_KEY else None,
+            "openai_key_set":bool(OPENAI_API_KEY),
+            "schema":KNOWLEDGE.get("schema"),
+            "version":KNOWLEDGE.get("version"),
+            "quick_faq_count":len(QUICK_FAQ),
+            "sources_count":len(SOURCES),
+            "default_intro_len":len((DEFAULT.get("intro") or "").strip()),
+            "extra_resources_count":len(DEFAULT.get("extra_resources") or []),
+            "cache_size":len(CACHE),
+            "flow":"1)faq 2)openai(gpt-4o-mini) 3)default(multi-bubble)"}
 
 @app.post("/api/chat")
 async def chat(request: Request):
-    """메인 스킬 엔드포인트"""
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(content=build_simple_text("요청 처리 중 오류가 발생했어요."))
+        return JSONResponse(content=build_multi_bubble_reply(_join_default_bubbles()))
 
-    utt = (body.get("userRequest") or {}).get("utterance", "").strip()
-    if not utt:
-        return JSONResponse(content=build_simple_text("안녕하세요! 무엇을 도와드릴까요?"))
+    utterance = (body.get("userRequest") or {}).get("utterance","").strip()
+    utt_n     = norm(utterance)
 
-    # 캐시 check
-    cache_key = utt.lower()
-    if cache_key in CACHE and time.time() - CACHE[cache_key]["t"] < CACHE_TTL:
-        return JSONResponse(content=build_simple_text(CACHE[cache_key]["text"]))
+    if not utterance:
+        return JSONResponse(content=build_multi_bubble_reply(_join_default_bubbles()))
 
-    # 1) quick_faq 정확/부분 매칭 (즉시, LLM 미호출)
-    faq_match = match_quick_faq(utt)
-    if faq_match and faq_match.get("answer"):
-        ans = faq_match["answer"]
-        CACHE[cache_key] = {"t": time.time(), "text": ans}
-        return JSONResponse(content=build_simple_text(ans))
+    cached = cache_get(utt_n)
+    if cached and cached.startswith("MULTI_BUBBLE::"):
+        try:
+            return JSONResponse(content=json.loads(cached[len("MULTI_BUBBLE::"):]))
+        except Exception:
+            pass
 
-    # 2) LLM 호출 (system_prompt ← knowledge.json)
-    #    faq_hint: 가장 잘 어울리는 1개 답변을 user 메시지에 함께 전달 (답변 일관성 ↑)
-    faq_hint = faq_match["answer"] if faq_match else ""
+    # (1) FAQ 매칭
+    faq_hit = match_quick_faq(utterance)
+    if faq_hit and faq_hit.get("answer"):
+        bubbles = answers_bubbles_for(faq_hit["answer"])
+        reply = build_multi_bubble_reply(bubbles)
+        cache_set(utt_n, "MULTI_BUBBLE::"+json.dumps(reply, ensure_ascii=False))
+        return JSONResponse(content=reply)
 
-    if not OPENAI_API_KEY:
-        return JSONResponse(content=build_simple_text(
-            DEFAULT.get("intro", "1:1 상담 연결 안내: 잠시 후 다시 시도하시거나 1:1 상담 연결을 통해 문의해 주세요.")
-        ))
+    # (2) OpenAI 자유 답변 (키가 등록돼 있을 때만 발사)
+    faq_hint = (faq_hit or {}).get("answer","") or ""
+    if OPENAI_API_KEY:
+        try:
+            ai_reply = await call_llm(utterance, faq_hint=faq_hint)
+            bubbles  = answers_bubbles_for(ai_reply)
+            reply    = build_multi_bubble_reply(bubbles)
+            cache_set(utt_n, "MULTI_BUBBLE::"+json.dumps(reply, ensure_ascii=False))
+            return JSONResponse(content=reply)
+        except Exception as e:
+            # Render Logs에 사유 노출 — 디버깅 가능하게
+            print(f"[llm-fail] {type(e).__name__}: {e} | utterance={utterance!r}", file=sys.stderr)
 
-    try:
-        ans = await call_llm(utt, faq_hint=faq_hint)
-    except Exception:
-        # LLM 실패 시: 캐스케이드 fallback
-        return JSONResponse(content=build_simple_text(
-            DEFAULT.get("intro", "1:1 상담 연결 안내: 잠시 후 다시 시도하시거나 1:1 상담 연결을 통해 문의해 주세요.")
-        ))
-
-    # 200자 가드레일 강제 트림
-    ans = truncate(ans, CHAR_LIMIT)
-
-    CACHE[cache_key] = {"t": time.time(), "text": ans}
-    return JSONResponse(content=build_simple_text(ans))
+    # (3) 키 없음 or 호출 실패 → default multi-bubble (긴 intro + 공식/지원단 + footer)
+    bubbles = _join_default_bubbles()
+    reply   = build_multi_bubble_reply(bubbles)
+    cache_set(utt_n, "MULTI_BUBBLE::"+json.dumps(reply, ensure_ascii=False))
+    return JSONResponse(content=reply)
 
 if __name__ == "__main__":
     import uvicorn
