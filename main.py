@@ -4,6 +4,8 @@ main.py — 카카오 i 오픈빌더 스킬 서버 (OpenAI 전용, FAQ 없음)
 
 설계
   - 모든 사용자 발화를 즉시 OpenAI Chat Completions API 로 전달
+  - OpenAI 호환 베이스 URL (OPENAI_BASE_URL) 자동 인식
+        → OpenAI 기본 사용, OPENAI_BASE_URL 세팅 시 Groq/Gemini 호환 라우터로 라우팅
   - FAQ · 정적 lookup · knowledge.json · 매칭 로직 일체 없음
   - 응답은 카톡 simpleText 990자 한도 내에서 multi-bubble
         bubble[0] = OpenAI 답변
@@ -47,6 +49,7 @@ from fastapi.responses import JSONResponse
 # ── 환경 변수 (전부 안전 디폴트) ─────────────────────────────
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL       = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL    = os.environ.get("OPENAI_BASE_URL", "").strip()  # ← 추가: 호환 라우터 (Groq 등)
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.4"))
 OPENAI_MAX_TOKENS  = int(os.environ.get("OPENAI_MAX_TOKENS", "500"))
 OPENAI_TIMEOUT     = float(os.environ.get("OPENAI_TIMEOUT", "4.0"))
@@ -67,7 +70,7 @@ SYSTEM_PROMPT = (
 _CACHE: dict = {}
 
 
-# ── OpenAI 클라이언트 lazy-init (key 없으면 생성 안 함) ────────
+# ── OpenAI 클라이언트 lazy-init (OpenAI 호환 base_url 지원) ──
 _client: Optional["OpenAI"] = None
 
 def _get_client():
@@ -76,8 +79,14 @@ def _get_client():
         return None
     if _client is None:
         try:
-            _client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT)
-            sys.stderr.write(f"[chat] OpenAI client ready model={OPENAI_MODEL}\n")
+            _client = OpenAI(
+                api_key=OPENAI_API_KEY,
+                base_url=OPENAI_BASE_URL or None,      # ← 추가: 비면 None = 공식 OpenAI, 채우면 호환 라우터
+                timeout=OPENAI_TIMEOUT,
+            )
+            sys.stderr.write(
+                f"[chat] OpenAI client ready model={OPENAI_MODEL} base_url={'default' if not OPENAI_BASE_URL else OPENAI_BASE_URL}\n"
+            )
         except Exception as e:
             sys.stderr.write(f"[chat] OpenAI client init fail: {type(e).__name__}: {e}\n")
             _client = None
@@ -168,10 +177,11 @@ app = FastAPI()
 @app.get("/")
 def root():
     return {
-        "service":      "kakao-ai-skill-openai",
-        "status":       "ok",
-        "openai_key":   bool(OPENAI_API_KEY),
-        "openai_model": OPENAI_MODEL,
+        "service":        "kakao-ai-skill-openai",
+        "status":         "ok",
+        "openai_key":     bool(OPENAI_API_KEY),
+        "openai_model":   OPENAI_MODEL,
+        "openai_base_url": OPENAI_BASE_URL or "(default api.openai.com)",
     }
 
 
@@ -198,7 +208,7 @@ async def chat(req: Request):
     answer = ""
     if OPENAI_API_KEY and _HAS_OPENAI and utterance:
         sys.stderr.write(
-            f"[chat] openai-req model={OPENAI_MODEL} len={len(utterance)} text={utterance[:30]!r}\n"
+            f"[chat] openai-req model={OPENAI_MODEL} base_url={'default' if not OPENAI_BASE_URL else OPENAI_BASE_URL} len={len(utterance)} text={utterance[:30]!r}\n"
         )
         answer = _call_openai(utterance)
         if answer:
@@ -216,8 +226,7 @@ async def chat(req: Request):
     if not answer:
         answer = (
             "안녕하세요. 일학습병행 원스탑 상담 AI입니다.\n\n"
-            "OpenAI 서비스가 일시적으로 응답하지 않아 자유 답변을 표시하지 못했습니다.\n"
-            "아래 공식 자료와 1:1 상담 연결을 통해 정확한 안내를 받으실 수 있습니다."
+            "OpenAI 서비스가 일시적으로 응답하지 않아 자유 답변을 표시하지 못했습니다."
         )
 
     body = build_multi_bubble(answer)
